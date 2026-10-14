@@ -10,10 +10,10 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .dbsetup import PRGDB_SETS
 from .interproscan import IPS6Options, IPS_MODES
 from .parallel import terminate_children
 from .pipeline import STEP_NAMES, Config, Pipeline
-from .refdb import PRGDB_SETS, fetch_prgdb
 
 log = logging.getLogger("pyrgaugury")
 
@@ -54,13 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output directory; re-running with the same directory resumes")
 
     db = run.add_argument_group("databases")
-    db.add_argument("--prgdb", type=Path, required=True,
-                    help="reference RGA protein FASTA, e.g. PRGdb 4.0 "
-                         "AllResistanceGenes.fasta.gz (see 'pyrgaugury fetch-prgdb')")
-    db.add_argument("--pfam", type=Path, required=True,
-                    help="directory containing Pfam-A.hmm(.gz) and Pfam-A.hmm.dat(.gz), or the "
-                         "Pfam-A.hmm path itself. If Pfam-A.hmm has been hmmpress-ed, profiles "
-                         "are streamed from disk; otherwise they are loaded into memory")
+    db.add_argument("--db", type=Path, metavar="DIR",
+                    help="database directory made by 'pyrgaugury setup-db'")
+    db.add_argument("--prgdb", type=Path, metavar="FASTA",
+                    help="override: reference RGA protein FASTA to use instead of the one "
+                         "in --db")
+    db.add_argument("--pfam", type=Path, metavar="PATH",
+                    help="override: directory with Pfam-A.hmm(.gz) and Pfam-A.hmm.dat(.gz) "
+                         "to use instead of the one in --db")
 
     tools = run.add_argument_group("tools")
     tools.add_argument("--tm-tool", choices=sorted(TM_DEFAULT_EXE), default="phobius",
@@ -85,28 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         "Without InterProScan, LRRs come from Pfam only and NB-ARC-only proteins are "
         "confirmed with Pfam gathering thresholds instead")
     engine = ipsg.add_mutually_exclusive_group()
+    engine.add_argument("--interproscan6", action="store_true",
+                        help="use InterProScan 6 with the data set up in --db "
+                             "('setup-db --interproscan6')")
     engine.add_argument("--interproscan", metavar="PATH",
                         help="use InterProScan 5: path to interproscan.sh")
-    engine.add_argument("--interproscan6-datadir", type=Path, metavar="DIR",
-                        help="use InterProScan 6 (Nextflow pipeline ebi-pf-team/interproscan6) "
-                             "with this data directory; data are downloaded into it as needed")
-    ipsg.add_argument("--ips6-profile", default="docker",
-                      help="InterProScan 6 Nextflow profile(s), e.g. docker, singularity, "
-                           "apptainer, or singularity,slurm")
-    ipsg.add_argument("--ips6-revision", default=IPS6Options.revision,
-                      help="InterProScan 6 release to run")
-    ipsg.add_argument("--nextflow", default="nextflow", help="nextflow executable")
-    ipsg.add_argument("--ips6-nextflow-version", default=IPS6Options.nextflow_version,
-                      metavar="VER",
-                      help="Nextflow version to run InterProScan 6 with (sets NXF_VER). "
-                           "Nextflow 26.10 cannot run InterProScan 6.0.2.2; pass 'installed' "
-                           "to use your installed version as-is")
-    appl = ipsg.add_mutually_exclusive_group()
-    appl.add_argument("--ips-mode", choices=sorted(IPS_MODES), default="quick",
-                      help="RGAugury database mode: quick = Pfam,Gene3D; "
-                           "deep = Pfam,Gene3D,SMART,SUPERFAMILY")
-    appl.add_argument("--ips-appl", metavar="LIST",
-                      help="explicit comma-separated InterProScan applications ('free' mode)")
+    _add_ips_options(ipsg, setup=False)
 
     opts = run.add_argument_group("options")
     opts.add_argument("-e", "--evalue", type=float, default=1e-5,
@@ -125,11 +110,65 @@ def build_parser() -> argparse.ArgumentParser:
     opts.add_argument("--keep-intermediate", action="store_true",
                       help="keep per-chunk working files")
 
-    fetch = sub.add_parser("fetch-prgdb", help="download a PRGdb 4.0 protein FASTA")
-    fetch.add_argument("-o", "--outdir", type=Path, required=True)
-    fetch.add_argument("--set", choices=sorted(PRGDB_SETS), default="all",
-                       help="all = putative + reference resistance proteins")
+    setup = sub.add_parser(
+        "setup-db", formatter_class=_HelpFormatter,
+        help="download and verify the databases into one directory for 'run --db'",
+        description="Download, verify and record the databases that 'pyrgaugury run --db' "
+                    "uses: PRGdb 4.0, Pfam-A and, optionally, InterProScan 6 data. Files "
+                    "already present that pass verification are kept, so re-running "
+                    "completes an interrupted setup or checks an existing one.")
+    setup.add_argument("-o", "--outdir", type=Path, required=True, metavar="DIR",
+                       help="database directory to create or update")
+    setup.add_argument("--prgdb-set", choices=sorted(PRGDB_SETS), default="all",
+                       help="PRGdb 4.0 protein set: all = putative + reference")
+    setup.add_argument("--press-pfam", action="store_true",
+                       help="also hmmpress Pfam (+2.5 GB) for low-memory runs: Pfam scans "
+                            "then use ~0.3 GB of RAM instead of ~3 GB, but run ~2.5x slower")
+    setup.add_argument("--interproscan6", action="store_true",
+                       help="also download InterProScan 6 data (needs Nextflow and a container "
+                            "engine; several GB; can take hours on a slow connection)")
+    _add_ips_options(setup.add_argument_group("InterProScan 6"), setup=True)
+    setup.add_argument("-t", "--threads", type=int, default=2, help="CPU threads")
+    setup.add_argument("--force", action="store_true",
+                       help="re-download PRGdb and Pfam even if present and intact")
     return parser
+
+
+def _add_ips_options(group, setup: bool) -> None:
+    """InterProScan options shared by 'run' and 'setup-db'."""
+    group.add_argument("--ips6-profile", default="docker" if setup else None,
+                       help="InterProScan 6 Nextflow profile(s), e.g. docker, singularity, "
+                            "apptainer, or singularity,slurm"
+                            + ("" if setup else " (default: as recorded by setup-db, "
+                                                "else docker)"))
+    group.add_argument("--ips6-revision", default=IPS6Options.revision if setup else None,
+                       help="InterProScan 6 release"
+                            + ("" if setup else " (default: as recorded by setup-db, so the "
+                                                "pipeline matches its data)"))
+    group.add_argument("--nextflow", default="nextflow", help="nextflow executable")
+    group.add_argument("--ips6-nextflow-version", default=IPS6Options.nextflow_version,
+                       metavar="VER",
+                       help="Nextflow version to run InterProScan 6 with (sets NXF_VER). "
+                            "Nextflow 26.10 cannot run InterProScan 6.0.2.2; pass 'installed' "
+                            "to use your installed version as-is")
+    appl = group.add_mutually_exclusive_group()
+    appl.add_argument("--ips-mode", choices=sorted(IPS_MODES),
+                      default="deep" if setup else "quick",
+                      help="RGAugury database mode: quick = Pfam,Gene3D; "
+                           "deep = Pfam,Gene3D,SMART,SUPERFAMILY"
+                           + ("; setting up deep also covers quick" if setup else ""))
+    appl.add_argument("--ips-appl", metavar="LIST",
+                      help="explicit comma-separated InterProScan applications ('free' mode)")
+
+
+def _ips6_options(args: argparse.Namespace, datadir: Path, recorded: dict) -> IPS6Options:
+    return IPS6Options(
+        datadir=datadir,
+        nextflow=_require_exe(args.nextflow, "nextflow"),
+        revision=args.ips6_revision or recorded.get("revision") or IPS6Options.revision,
+        profile=args.ips6_profile or recorded.get("profile") or "docker",
+        nextflow_version=None if args.ips6_nextflow_version in ("", "installed")
+        else args.ips6_nextflow_version)
 
 
 def _require_exe(name: str, what: str) -> str:
@@ -154,26 +193,38 @@ def _setup_logging(logfile: Path | None = None) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
+    from .dbsetup import read_manifest, resolve_database
+    from .pfam import locate_pfam
     _require_file(args.genome, "genome FASTA")
     _require_file(args.gff3, "GFF3 annotation")
+    if args.db is None and (args.prgdb is None or args.pfam is None):
+        raise SystemExit("error: give --db (a directory made by 'pyrgaugury setup-db'), "
+                         "or both --prgdb and --pfam")
+    _require_file(args.db, "database directory")
+    found = resolve_database(args.db) if args.db is not None else {}
     _require_file(args.prgdb, "reference FASTA")
     _require_file(args.pfam, "Pfam database")
-    from .pfam import locate_pfam
+    prgdb = args.prgdb or found.get("prgdb")
+    pfam = args.pfam or found.get("pfam")
+    if prgdb is None or not prgdb.exists():
+        raise SystemExit(f"error: no PRGdb reference FASTA in {args.db}; run "
+                         f"'pyrgaugury setup-db -o {args.db}'")
     try:
-        locate_pfam(args.pfam)
+        locate_pfam(pfam)
     except FileNotFoundError as exc:
-        raise SystemExit(f"error: {exc}")
+        hint = f"; run 'pyrgaugury setup-db -o {args.db}'" if args.pfam is None else ""
+        raise SystemExit(f"error: {exc}{hint}")
     tm_exe = _require_exe(args.tm_exe or TM_DEFAULT_EXE[args.tm_tool], f"{args.tm_tool}")
     ips_exe = _require_exe(args.interproscan, "InterProScan") if args.interproscan else None
     ips6 = None
-    if args.interproscan6_datadir is not None:
-        args.interproscan6_datadir.mkdir(parents=True, exist_ok=True)
-        ips6 = IPS6Options(
-            datadir=args.interproscan6_datadir,
-            nextflow=_require_exe(args.nextflow, "nextflow"),
-            revision=args.ips6_revision, profile=args.ips6_profile,
-            nextflow_version=None if args.ips6_nextflow_version in ("", "installed")
-            else args.ips6_nextflow_version)
+    if args.interproscan6:
+        if args.db is None:
+            raise SystemExit("error: --interproscan6 uses the InterProScan 6 data in --db")
+        recorded = read_manifest(args.db).get("interproscan6", {})
+        if not recorded:
+            raise SystemExit(f"error: {args.db} has no InterProScan 6 data; run "
+                             f"'pyrgaugury setup-db -o {args.db} --interproscan6'")
+        ips6 = _ips6_options(args, found["interproscan"], recorded)
     blastp, makeblastdb = args.blastp, args.makeblastdb
     diamond, mmseqs = args.diamond, args.mmseqs
     if args.search_tool == "diamond":
@@ -201,7 +252,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     log.info("pyrgaugury %s: %s", __version__, " ".join(sys.argv))
 
     cfg = Config(
-        genome=args.genome, outdir=args.outdir, prgdb=args.prgdb, pfam=args.pfam,
+        genome=args.genome, outdir=args.outdir, prgdb=prgdb, pfam=pfam,
         tm_tool=args.tm_tool, tm_exe=tm_exe, gff3=args.gff3, gene_models=gene_models,
         interproscan=ips_exe, ips6=ips6,
         ips_appl=args.ips_appl or IPS_MODES[args.ips_mode], evalue=args.evalue,
@@ -229,14 +280,40 @@ def _on_sigterm(signum, frame):
     raise KeyboardInterrupt
 
 
+def cmd_setup_db(args: argparse.Namespace) -> None:
+    from .dbsetup import setup_databases
+    ips6 = None
+    if args.interproscan6:
+        ips6 = _ips6_options(args, args.outdir / "interproscan", {})
+    args.outdir.mkdir(parents=True, exist_ok=True)
+    _setup_logging(args.outdir / "setup-db.log")
+    log.info("pyrgaugury %s: %s", __version__, " ".join(sys.argv))
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        manifest = setup_databases(args.outdir, args.prgdb_set, args.press_pfam, ips6,
+                                   args.ips_appl or IPS_MODES[args.ips_mode], args.threads,
+                                   args.force)
+    except KeyboardInterrupt:
+        terminate_children()
+        log.error("Interrupted. Re-run the same command to continue.")
+        raise SystemExit(130)
+    except Exception:
+        terminate_children()
+        raise
+    log.info("Databases ready in %s: PRGdb %s (%d sequences), Pfam %s%s%s", args.outdir,
+             manifest["prgdb"]["set"], manifest["prgdb"]["sequences"],
+             manifest["pfam"]["release"], " (pressed)" if manifest["pfam"]["pressed"] else "",
+             f", InterProScan 6 {manifest['interproscan6']['revision']} data"
+             if "interproscan6" in manifest else "")
+    log.info("Use: pyrgaugury run --db %s ...", args.outdir)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.command == "run":
         cmd_run(args)
-    elif args.command == "fetch-prgdb":
-        _setup_logging()
-        path = fetch_prgdb(args.set, args.outdir)
-        log.info("Saved %s", path)
+    elif args.command == "setup-db":
+        cmd_setup_db(args)
 
 
 if __name__ == "__main__":

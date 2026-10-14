@@ -16,11 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import __version__
 from .interproscan import IPS6Options
 from .seqio import read_fasta
 
 log = logging.getLogger(__name__)
+
+# Recorded in every completion flag. Bump it only when a release changes what
+# a step computes, so that upgrading pyrgaugury re-runs steps when results
+# could differ but not for interface-only changes.
+RESULTS_VERSION = "0.1.0"
 
 
 @dataclass
@@ -103,7 +107,7 @@ class Pipeline:
             if not step.enabled(self.cfg):
                 log.info("[%s] not configured; skipping", step.name)
                 continue
-            params = {"version": __version__, **step.params(self.cfg)}
+            params = {"version": RESULTS_VERSION, **step.params(self.cfg)}
             flag = self.flags / f"{step.name}.done"
             reason = None
             if step.name in forced:

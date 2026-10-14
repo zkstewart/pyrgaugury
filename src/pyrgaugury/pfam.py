@@ -135,10 +135,12 @@ def _text(value) -> str:
 
 def _load_profiles(hmm_path: Path):
     import pyhmmer
-    pressed = Path(str(hmm_path) + ".h3m")
-    if pressed.exists():
-        log.info("Using pressed Pfam database %s (streamed from disk)", hmm_path)
-        return pyhmmer.plan7.HMMPressedFile(hmm_path)
+    # hmmpress output is named after the uncompressed file, even when it was
+    # pressed from Pfam-A.hmm.gz
+    prefix = hmm_path.with_name(hmm_path.name.removesuffix(".gz"))
+    if Path(f"{prefix}.h3m").exists():
+        log.info("Using pressed Pfam database %s (streamed from disk)", prefix)
+        return pyhmmer.plan7.HMMPressedFile(prefix)
     log.info("Loading %s into memory (hmmpress it to stream from disk instead)", hmm_path)
     with pyhmmer.plan7.HMMFile(hmm_path) as fh:
         return list(fh)

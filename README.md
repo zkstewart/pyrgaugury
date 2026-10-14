@@ -50,25 +50,48 @@ Phobius 1.01's `phobius.pl` calls a 32-bit `decodeanhmm` that will not run on
 most current 64-bit systems. Point line 25 of `phobius.pl` at the bundled
 `decodeanhmm.64bit` instead.
 
-Databases (the examples below assume they live under `$DB`):
+## Databases (`setup-db`)
 
-* **PRGdb 4.0** reference proteins: `pyrgaugury fetch-prgdb -o db/` downloads
-  `AllResistanceGenes.fasta.gz` (586,891 proteins from 181 species).
-  `--set putative|reference` downloads the subsets.
-* **Pfam-A**: `Pfam-A.hmm.gz` and `Pfam-A.hmm.dat.gz` from
-  <https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release/>. Both may stay
-  gzipped. If you run `hmmpress Pfam-A.hmm` on an uncompressed copy, profiles
-  are streamed from disk; otherwise the whole of Pfam is loaded into memory,
-  which takes a few GB.
+`setup-db` downloads, verifies and records everything `run` needs in one
+directory:
+
+```bash
+pyrgaugury setup-db -o db/                      # PRGdb 4.0 + Pfam-A
+pyrgaugury setup-db -o db/ --interproscan6      # ... + InterProScan 6 data
+```
+
+```
+db/
+├── pyrgaugury_db.json   manifest: sources, releases, checksums, dates
+├── prgdb/               PRGdb 4.0 AllResistanceGenes.fasta.gz (586,891 proteins,
+│                        181 species); --prgdb-set putative|reference for subsets
+├── pfam/                Pfam-A.hmm.gz + Pfam-A.hmm.dat.gz (current EBI release)
+└── interproscan/        InterProScan 6 data (with --interproscan6)
+```
+
+* **Verification.** Pfam files are checked against EBI's MD5 checksums and
+  PRGdb by a full gzip read. Files already present that pass are kept, so
+  re-running `setup-db` checks an existing directory and completes an
+  interrupted one. An interrupted download continues from where it stopped.
+  `--force` re-downloads PRGdb and Pfam.
+* **InterProScan 6 data** are fetched by running InterProScan 6 once on a
+  single protein. By default this covers the `deep` member databases, which
+  also covers `quick`. A first setup downloads several GB and can take hours,
+  because EBI serves the files slowly and one at a time (see *InterProScan*
+  below).
+* **`--press-pfam`** also `hmmpress`es Pfam (+2.5 GB) for machines short of
+  memory. Pfam scans then stream profiles from disk using ~0.3 GB of RAM
+  instead of ~3 GB, but take ~2.5× longer. On 4,745 proteins this was 191 s
+  instead of 78 s, with identical hits.
+
+A directory assembled by hand in this layout also works without a manifest.
+`run --prgdb FASTA` and `run --pfam DIR` override individual components.
 
 ## Usage
 
 ```bash
-DB=/path/to/databases   # contains prgdb/, pfam/ and (optionally) interproscan/
-
 # Annotated genome: annotation augmented with miniprot models (hybrid, the default)
-pyrgaugury run -g genome.fa.gz --gff3 genes.gff3.gz \
-    --prgdb $DB/prgdb/AllResistanceGenes.fasta.gz --pfam $DB/pfam \
+pyrgaugury run -g genome.fa.gz --gff3 genes.gff3.gz --db db/ \
     --tm-tool phobius --tm-exe /path/to/phobius/phobius.pl \
     -o out/ -t 16
 
@@ -76,10 +99,9 @@ pyrgaugury run -g genome.fa.gz --gff3 genes.gff3.gz \
 pyrgaugury run -g genome.fa.gz --gff3 genes.gff3.gz --gene-models annotation ...
 
 # Unannotated genome (miniprot only), TMHMM, InterProScan 6 in deep mode
-pyrgaugury run -g genome.fa.gz \
-    --prgdb $DB/prgdb/AllResistanceGenes.fasta.gz --pfam $DB/pfam \
+pyrgaugury run -g genome.fa.gz --db db/ \
     --tm-tool tmhmm --tm-exe /path/to/tmhmm-2.0d/bin/tmhmm \
-    --interproscan6-datadir $DB/interproscan --ips-mode deep \
+    --interproscan6 --ips-mode deep \
     -o out/ -t 16
 ```
 
@@ -89,11 +111,12 @@ Run `pyrgaugury run --help` for every option.
 
 InterProScan is optional. Choose one engine:
 
-* **InterProScan 6** (`--interproscan6-datadir DIR`). pyrgaugury runs the
-  `ebi-pf-team/interproscan6` Nextflow pipeline (release `--ips6-revision`,
-  default 6.0.2.2) with `--ips6-profile` (default `docker`; use e.g.
-  `singularity,slurm` on a cluster). Member-database data are downloaded into
-  `DIR` on first use and reused afterwards. Nextflow's working files stay in
+* **InterProScan 6** (`--interproscan6`, after `setup-db --interproscan6`).
+  pyrgaugury runs the `ebi-pf-team/interproscan6` Nextflow pipeline with the
+  data in `db/interproscan/`. It uses the release and profile recorded by
+  `setup-db` (default 6.0.2.2 with `docker`), so the pipeline always matches
+  its data; `--ips6-revision` and `--ips6-profile` override them, e.g.
+  `singularity,slurm` on a cluster. Nextflow's working files stay in
   `07_interproscan/tmp/` and are removed once the step succeeds.
 * **InterProScan 5** (`--interproscan /path/to/interproscan.sh`), as RGAugury
   used it.
@@ -133,7 +156,7 @@ To run InterProScan 6 by hand, use:
 
 ```bash
 NXF_VER=26.04.0 nextflow run ebi-pf-team/interproscan6 -r 6.0.2.2 -profile docker,test \
-    --datadir $DB/interproscan --interpro latest
+    --datadir db/interproscan --interpro latest
 ```
 
 ### Gene models (`--gene-models`)
@@ -224,7 +247,8 @@ skipped when its flag exists, those parameters are unchanged, and none of its
 upstream steps re-ran. Changing a parameter therefore re-runs only the affected
 steps. For example, adding `--interproscan` to a finished run runs only
 `interproscan` and `classify`. To force re-running from a step onwards, use
-`--restart-from STEP`.
+`--restart-from STEP`. Upgrading pyrgaugury re-runs steps only if the new
+release changes what they compute, not for interface changes.
 
 Steps: `reference_db` → `gene_models` → `blast_filter` → `pfam_scan`,
 `coils`, `transmembrane`, `interproscan` → `classify`.

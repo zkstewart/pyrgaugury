@@ -1,35 +1,15 @@
-"""Reference RGA database (PRGdb 4.0): download, clean and BLAST-index."""
+"""Reference RGA database: clean it and build the similarity-search index."""
 
 from __future__ import annotations
 
 import hashlib
 import logging
-import shutil
 import subprocess
-import urllib.request
 from pathlib import Path
 
 from .seqio import atomic_write, read_fasta, write_fasta
 
 log = logging.getLogger(__name__)
-
-PRGDB_BASE = "https://www.prgdb.org/prgdb4"
-PRGDB_SETS = {
-    "all": "AllResistanceGenes.fasta.gz",
-    "putative": "PutativeResistanceGenes.fasta.gz",
-    "reference": "ReferenceResistanceGenes.fasta.gz",
-}
-
-
-def fetch_prgdb(dataset: str, outdir: Path) -> Path:
-    outdir.mkdir(parents=True, exist_ok=True)
-    name = PRGDB_SETS[dataset]
-    dest = outdir / name
-    url = f"{PRGDB_BASE}/{name}"
-    log.info("Downloading %s -> %s", url, dest)
-    with urllib.request.urlopen(url, timeout=120) as resp, atomic_write(dest, "wb") as fh:
-        shutil.copyfileobj(resp, fh, length=1 << 20)
-    return dest
 
 
 def prepare_reference(source: Path, out_faa: Path) -> tuple[int, int]:

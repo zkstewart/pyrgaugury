@@ -333,3 +333,65 @@ printf 'q0\\tm\\t9\\tPfam\\tPF00931\\tNB-ARC\\t1\\t9\\t1e-9\\tT\\td\\t-\\t-\\t-\
     assert lines[0].startswith("26.04.0 run ebi-pf-team/interproscan6 -r 6.0.2.2")
     assert "--applications Pfam,Gene3D" in lines[0] and "--max-workers 4" in lines[0]
     assert read_ips_table(out)[0]["seq_id"] == "geneA"
+
+
+# ---- setup-db --------------------------------------------------------------
+def _serve(payload: bytes, ranges: bool):
+    """Start a local HTTP server returning ``payload``; returns (url, seen headers, stop)."""
+    import http.server
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            seen.append(rng)
+            start = int(rng.split("=")[1].rstrip("-")) if (rng and ranges) else 0
+            body = payload[start:]
+            self.send_response(206 if start else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}/f.gz", seen, server.shutdown
+
+
+@pytest.mark.parametrize("ranges", [True, False])
+def test_download_continues_partial_file(tmp_path, ranges):
+    from pyrgaugury.dbsetup import download
+    payload = bytes(range(256)) * 4000
+    url, seen, stop = _serve(payload, ranges)
+    dest = tmp_path / "f.gz"
+    (tmp_path / "f.gz.partial").write_bytes(payload[:300_000])   # an interrupted run
+    try:
+        download(url, dest)
+    finally:
+        stop()
+    assert dest.read_bytes() == payload and not (tmp_path / "f.gz.partial").exists()
+    assert seen == ["bytes=300000-"]   # asked to continue; restarts if the server can't
+
+
+def test_gzip_ok_detects_truncation(tmp_path):
+    from pyrgaugury.dbsetup import gzip_ok
+    good = tmp_path / "a.gz"
+    good.write_bytes(gzip.compress(b">s\nMKV\n" * 10000))
+    bad = tmp_path / "b.gz"
+    bad.write_bytes(good.read_bytes()[:-50])
+    assert gzip_ok(good) and not gzip_ok(bad)
+
+
+def test_resolve_database_with_and_without_manifest(tmp_path):
+    from pyrgaugury.dbsetup import resolve_database, write_manifest
+    (tmp_path / "prgdb").mkdir()
+    (tmp_path / "prgdb" / "ReferenceResistanceGenes.fasta.gz").write_bytes(b"")
+    found = resolve_database(tmp_path)          # hand-made layout, no manifest
+    assert found["prgdb"].name == "ReferenceResistanceGenes.fasta.gz"
+    assert found["pfam"] == tmp_path / "pfam"
+    write_manifest(tmp_path, {"prgdb": {"file": "prgdb/custom.fa.gz"}})
+    assert resolve_database(tmp_path)["prgdb"] == tmp_path / "prgdb" / "custom.fa.gz"
