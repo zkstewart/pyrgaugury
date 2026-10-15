@@ -474,3 +474,58 @@ def test_resolve_database_with_and_without_manifest(tmp_path):
     assert found["pfam"] == tmp_path / "pfam"
     write_manifest(tmp_path, {"prgdb": {"file": "prgdb/custom.fa.gz"}})
     assert resolve_database(tmp_path)["prgdb"] == tmp_path / "prgdb" / "custom.fa.gz"
+
+
+def test_fetch_text_retries_refused_connections(monkeypatch):
+    import io
+    import urllib.error
+    from pyrgaugury import dbsetup
+
+    calls = []
+
+    def flaky(url, timeout):
+        calls.append(url)
+        if len(calls) < 3:
+            raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        return io.BytesIO(b"ok\n")
+
+    monkeypatch.setattr(dbsetup.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(dbsetup.time, "sleep", lambda s: None)
+    assert dbsetup._fetch_text("https://ftp.ebi.ac.uk/x") == "ok\n" and len(calls) == 3
+
+    def refused(url, timeout):
+        calls.append(url)
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    calls.clear()
+    monkeypatch.setattr(dbsetup.urllib.request, "urlopen", refused)
+    with pytest.raises(dbsetup.NetworkError, match="ftp.ebi.ac.uk.*Connection refused"):
+        dbsetup._fetch_text("https://ftp.ebi.ac.uk/x")
+    assert len(calls) == dbsetup.FETCH_ATTEMPTS
+
+
+def test_setup_pfam_falls_back_to_recorded_md5s(tmp_path, monkeypatch):
+    from pyrgaugury import dbsetup
+
+    pfam = tmp_path / "pfam"
+    pfam.mkdir()
+    for name in dbsetup.PFAM_FILES:
+        (pfam / name).write_bytes(name.encode())
+    recorded = {"release": "38.2", "dir": "pfam", "pressed": False,
+                "md5": {n: dbsetup.md5sum(pfam / n) for n in dbsetup.PFAM_FILES},
+                "verified": "earlier"}
+
+    def unreachable(url):
+        raise dbsetup.NetworkError(f"could not fetch {url}")
+
+    monkeypatch.setattr(dbsetup, "_fetch_text", unreachable)
+    info = dbsetup.setup_pfam(tmp_path, press=False, force=False, recorded=recorded)
+    assert info["release"] == "38.2" and info["md5"] == recorded["md5"]
+
+    with pytest.raises(dbsetup.NetworkError):            # nothing recorded to check against
+        dbsetup.setup_pfam(tmp_path, press=False, force=False, recorded=None)
+    with pytest.raises(dbsetup.NetworkError):            # --force wants a fresh download
+        dbsetup.setup_pfam(tmp_path, press=False, force=True, recorded=recorded)
+    (pfam / "Pfam-A.hmm.gz").write_bytes(b"changed")
+    with pytest.raises(dbsetup.NetworkError):            # file no longer matches the record
+        dbsetup.setup_pfam(tmp_path, press=False, force=False, recorded=recorded)

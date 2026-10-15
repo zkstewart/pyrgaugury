@@ -77,6 +77,11 @@ db/
   re-running `setup-db` checks an existing directory and completes an
   interrupted one. An interrupted download continues from where it stopped.
   `--force` re-downloads PRGdb, Pfam and the InterProScan 6 pipeline.
+* **Unreliable connections.** Refused or dropped connections are retried.
+  If EBI still cannot be reached, files already present are checked against
+  the MD5s and releases recorded at the previous setup, with a warning that
+  newer releases were not looked for. Anything that does need downloading
+  stops `setup-db` with a one-line error; re-running continues from there.
 * **InterProScan 6** (`--interproscan6`) sets up everything a run needs
   without internet access (see *Running on a cluster* below):
   * a copy of the pipeline code (`--ips6-revision`, default 6.0.2.2);

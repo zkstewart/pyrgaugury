@@ -338,7 +338,7 @@ def _on_sigterm(signum, frame):
 
 
 def cmd_setup_db(args: argparse.Namespace) -> None:
-    from .dbsetup import setup_databases
+    from .dbsetup import NetworkError, setup_databases
     ips6 = None
     if args.interproscan6:
         ips6 = _ips6_options(args, args.outdir / "interproscan")
@@ -354,6 +354,12 @@ def cmd_setup_db(args: argparse.Namespace) -> None:
         terminate_children()
         log.error("Interrupted. Re-run the same command to continue.")
         raise SystemExit(130)
+    except NetworkError as exc:
+        terminate_children()
+        log.error("%s. Nothing set up so far is lost: re-run the same command to continue. "
+                  "setup-db needs outbound internet access (on a cluster, use a login node; "
+                  "check https_proxy if your site uses a proxy).", exc)
+        raise SystemExit(1)
     except Exception:
         terminate_children()
         raise

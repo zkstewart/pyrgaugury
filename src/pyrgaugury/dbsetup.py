@@ -28,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .interproscan import IPS6_REPO, IPS6Options, run_interproscan6
 from .seqio import atomic_write, read_fasta
@@ -66,6 +67,13 @@ _IPS6_SETUP_PROTEIN = (
     "KLRKLPLDSKSGIAGEELVIYYGEREWIERVEWEDQATQLRFLPSSRWRWRET")
 
 
+FETCH_ATTEMPTS = 4
+
+
+class NetworkError(RuntimeError):
+    """A server could not be reached, even after retrying."""
+
+
 # ---------------------------------------------------------------------------
 # downloads
 # ---------------------------------------------------------------------------
@@ -97,10 +105,14 @@ def download(url: str, dest: Path, attempts: int = 5) -> None:
             if exc.code == 416 and have:  # range past the end: file already complete
                 os.replace(partial, dest)
                 return
-            raise
+            if exc.code < 500 or attempt == attempts:
+                raise NetworkError(f"downloading {url} failed: {exc}") from exc
+            log.warning("Download of %s failed (%s); retrying (attempt %d of %d)",
+                        dest.name, exc, attempt + 1, attempts)
+            time.sleep(min(60, 5 * attempt))
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             if attempt == attempts:
-                raise RuntimeError(f"downloading {url} failed: {exc}") from exc
+                raise NetworkError(f"downloading {url} failed: {_reason(exc)}") from exc
             log.warning("Download of %s interrupted (%s); resuming (attempt %d of %d)",
                         dest.name, exc, attempt + 1, attempts)
             time.sleep(min(60, 5 * attempt))
@@ -120,10 +132,27 @@ def _copy_with_progress(src, dst, done: int, total: int, name: str) -> None:
             next_report += step
 
 
-def _fetch_text(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=60) as resp:
-        data = resp.read()
-    return (gzip.decompress(data) if url.endswith(".gz") else data).decode()
+def _fetch_text(url: str, attempts: int = FETCH_ATTEMPTS) -> str:
+    """Fetch a small text file, retrying refused or dropped connections."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                data = resp.read()
+            return (gzip.decompress(data) if url.endswith(".gz") else data).decode()
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            client_error = isinstance(exc, urllib.error.HTTPError) and exc.code < 500
+            if client_error or attempt == attempts:
+                raise NetworkError(f"could not fetch {url} from {urlsplit(url).hostname}: "
+                                   f"{_reason(exc)}") from exc
+            delay = 5 * 2 ** (attempt - 1)
+            log.warning("Could not reach %s (%s); retrying in %d s (attempt %d of %d)",
+                        urlsplit(url).hostname, _reason(exc), delay, attempt + 1, attempts)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+def _reason(exc: BaseException) -> str:
+    return str(getattr(exc, "reason", None) or exc)
 
 
 def md5sum(path: Path) -> str:
@@ -167,18 +196,35 @@ def setup_prgdb(dbdir: Path, dataset: str, force: bool) -> dict:
             "sequences": n, "md5": md5sum(dest)}
 
 
-def setup_pfam(dbdir: Path, press: bool, force: bool) -> dict:
+def setup_pfam(dbdir: Path, press: bool, force: bool, recorded: dict | None = None) -> dict:
+    """Download or verify Pfam against EBI's current release.
+
+    If EBI cannot be reached, files already present are verified against the
+    MD5s in ``recorded`` (the manifest's earlier Pfam entry) instead.
+    """
     pfam = dbdir / "pfam"
     pfam.mkdir(parents=True, exist_ok=True)
-    expected = {}
-    for line in _fetch_text(f"{PFAM_BASE}/md5_checksums").splitlines():
-        parts = line.split()
-        if len(parts) == 2:
-            expected[parts[1]] = parts[0]
-    release = "unknown"
-    for line in _fetch_text(f"{PFAM_BASE}/Pfam.version.gz").splitlines():
-        if line.startswith("Pfam release"):
-            release = line.split(":", 1)[1].strip()
+    try:
+        expected = {}
+        for line in _fetch_text(f"{PFAM_BASE}/md5_checksums").splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                expected[parts[1]] = parts[0]
+        release = "unknown"
+        for line in _fetch_text(f"{PFAM_BASE}/Pfam.version.gz").splitlines():
+            if line.startswith("Pfam release"):
+                release = line.split(":", 1)[1].strip()
+    except NetworkError as exc:
+        if force or not _pfam_matches_record(pfam, recorded):
+            raise
+        log.warning("Pfam: %s; verified the files present against the MD5s recorded at "
+                    "setup instead (release %s), without checking for a newer release",
+                    exc, recorded.get("release", "unknown"))
+        pressed = all(Path(f"{pfam / 'Pfam-A.hmm'}{s}").exists() for s in PRESSED_SUFFIXES)
+        if press and not pressed:
+            _press_pfam(pfam / "Pfam-A.hmm.gz", pfam / "Pfam-A.hmm")
+            pressed = True
+        return {**recorded, "pressed": pressed}
 
     changed = False
     for name in PFAM_FILES:
@@ -205,6 +251,18 @@ def setup_pfam(dbdir: Path, press: bool, force: bool) -> dict:
     return {"release": release, "dir": "pfam",
             "pressed": all(p.exists() for p in pressed),
             "md5": {n: expected[n] for n in PFAM_FILES}}
+
+
+def _pfam_matches_record(pfam: Path, recorded: dict | None) -> bool:
+    md5 = (recorded or {}).get("md5", {})
+    if not all(name in md5 for name in PFAM_FILES):
+        return False
+    for name in PFAM_FILES:
+        if not (pfam / name).exists() or md5sum(pfam / name) != md5[name]:
+            log.error("Pfam: %s is missing or does not match the MD5 recorded at setup", name)
+            return False
+        log.info("Pfam: %s already present (MD5 matches the record)", name)
+    return True
 
 
 def _press_pfam(hmm_gz: Path, prefix: Path) -> None:
@@ -267,7 +325,7 @@ def latest_interpro(revision: str) -> str:
 
 
 def setup_interproscan6(dbdir: Path, opts: IPS6Options, appl: str, threads: int,
-                        force: bool = False) -> dict:
+                        force: bool = False, recorded: dict | None = None) -> dict:
     """Fetch the pipeline, populate its data directory and cache its containers.
 
     InterProScan 6 downloads the data for every selected analysis before it
@@ -279,7 +337,15 @@ def setup_interproscan6(dbdir: Path, opts: IPS6Options, appl: str, threads: int,
     pipeline, commit = setup_ips6_pipeline(dbdir, opts.revision, force)
     opts.pipeline = pipeline
     if opts.interpro is None:
-        opts.interpro = latest_interpro(opts.revision)
+        try:
+            opts.interpro = latest_interpro(opts.revision)
+        except NetworkError as exc:
+            recorded = recorded or {}
+            if recorded.get("revision") != opts.revision or not recorded.get("interpro_release"):
+                raise
+            opts.interpro = recorded["interpro_release"]
+            log.warning("InterProScan 6: %s; keeping the InterPro release recorded at setup "
+                        "(%s) without checking for a newer one", exc, opts.interpro)
     opts.lookup = False
     opts.container_cache = dbdir / IPS6_CONTAINER_DIR
     opts.container_cache.mkdir(exist_ok=True)
@@ -327,11 +393,13 @@ def setup_databases(dbdir: Path, prgdb_set: str, press_pfam: bool,
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
 
     for key, func in (("prgdb", lambda: setup_prgdb(dbdir, prgdb_set, force)),
-                      ("pfam", lambda: setup_pfam(dbdir, press_pfam, force))):
+                      ("pfam", lambda: setup_pfam(dbdir, press_pfam, force,
+                                                  manifest.get("pfam")))):
         manifest[key] = {**func(), "verified": stamp}
         write_manifest(dbdir, {**manifest, "pyrgaugury": __version__})
     if ips6 is not None:
-        manifest["interproscan6"] = {**setup_interproscan6(dbdir, ips6, ips_appl, threads, force),
+        manifest["interproscan6"] = {**setup_interproscan6(dbdir, ips6, ips_appl, threads, force,
+                                                         manifest.get("interproscan6")),
                                      "verified": stamp}
     manifest["pyrgaugury"] = __version__
     write_manifest(dbdir, manifest)
