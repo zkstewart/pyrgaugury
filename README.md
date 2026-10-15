@@ -66,17 +66,30 @@ db/
 ├── prgdb/               PRGdb 4.0 AllResistanceGenes.fasta.gz (586,891 proteins,
 │                        181 species); --prgdb-set putative|reference for subsets
 ├── pfam/                Pfam-A.hmm.gz + Pfam-A.hmm.dat.gz (current EBI release)
-└── interproscan/        InterProScan 6 data (with --interproscan6)
+├── interproscan/        InterProScan 6 data (with --interproscan6)
+├── interproscan6-pipeline/
+│                        InterProScan 6 pipeline code, one folder per release
+└── containers/          InterProScan 6 Apptainer/Singularity images
 ```
 
 * **Verification.** Pfam files are checked against EBI's MD5 checksums and
   PRGdb by a full gzip read. Files already present that pass are kept, so
   re-running `setup-db` checks an existing directory and completes an
   interrupted one. An interrupted download continues from where it stopped.
-  `--force` re-downloads PRGdb and Pfam.
-* **InterProScan 6 data** are fetched by running InterProScan 6 once on a
-  single protein. By default this covers the `deep` member databases, which
-  also covers `quick`. A first setup downloads several GB and can take hours,
+  `--force` re-downloads PRGdb, Pfam and the InterProScan 6 pipeline.
+* **InterProScan 6** (`--interproscan6`) sets up everything a run needs
+  without internet access (see *Running on a cluster* below):
+  * a copy of the pipeline code (`--ips6-revision`, default 6.0.2.2);
+  * the newest InterPro data release compatible with it, or
+    `--ips6-interpro RELEASE`. The release is recorded and every run uses it;
+  * the container images, cached in `containers/` when the profile
+    (`--ips6-profile`) is `apptainer` or `singularity`. Docker keeps images
+    itself.
+
+  It does this by running InterProScan 6 once on a single protein, with EBI's
+  online match lookup turned off, so every analysis runs and its image is
+  pulled. By default this covers the `deep` member databases, which also
+  covers `quick`. A first setup downloads several GB and can take hours,
   because EBI serves the files slowly and one at a time (see *InterProScan*
   below).
 * **`--press-pfam`** also `hmmpress`es Pfam (+2.5 GB) for machines short of
@@ -112,18 +125,53 @@ Run `pyrgaugury run --help` for every option.
 InterProScan is optional. Choose one engine:
 
 * **InterProScan 6** (`--interproscan6`, after `setup-db --interproscan6`).
-  pyrgaugury runs the `ebi-pf-team/interproscan6` Nextflow pipeline with the
-  data in `db/interproscan/`. It uses the release and profile recorded by
-  `setup-db` (default 6.0.2.2 with `docker`), so the pipeline always matches
-  its data; `--ips6-revision` and `--ips6-profile` override them, e.g.
-  `singularity,slurm` on a cluster. Nextflow's working files stay in
-  `07_interproscan/tmp/` and are removed once the step succeeds.
+  pyrgaugury runs the InterProScan 6 Nextflow pipeline from `db/` with the
+  data in `db/interproscan/`. It uses the pipeline release, InterPro data
+  release and profile recorded by `setup-db` (default 6.0.2.2 with
+  `docker`), so the pipeline always matches its data. `--ips6-revision`,
+  `--ips6-interpro` and `--ips6-profile` override them. Nextflow's working
+  files stay in `07_interproscan/tmp/` and are removed once the step
+  succeeds.
 * **InterProScan 5** (`--interproscan /path/to/interproscan.sh`), as RGAugury
   used it.
 
 `--ips-mode quick` (Pfam + Gene3D, the default) or `deep` (+ SMART and
 SUPERFAMILY) selects the member databases, as in RGAugury. `--ips-appl`
 gives an explicit list instead.
+
+**Running on a cluster.** Compute nodes usually have no Docker (use
+`--ips6-profile apptainer` or `singularity`) and limited or no internet
+access. A `run` therefore makes no network calls of its own:
+
+* Nextflow runs the local pipeline copy with `NXF_OFFLINE=true`. Fetching
+  `ebi-pf-team/interproscan6` from GitHub instead costs a GitHub API call per
+  run, and without a token GitHub allows 60 per hour per IP address, which
+  a cluster's nodes usually share. Concurrent jobs then fail with "API rate
+  limit exceeded".
+* The InterPro release is passed explicitly with
+  `--skip-interpro-version-check`. With the default `--interpro latest`,
+  InterProScan 6.0.2.2 asks EBI's FTP server which releases are compatible;
+  if that fails and its Globus fallback succeeds, it looks for a data folder
+  literally named `latest`, finds none and tries to download the whole
+  InterPro release again.
+* Images come from `db/containers/` (via `NXF_APPTAINER_CACHEDIR` and
+  `NXF_SINGULARITY_CACHEDIR`, unless you set those yourself), so concurrent
+  jobs don't each pull the same images into one cache.
+* `--ips6-no-lookup` turns off InterProScan's lookup of precomputed matches
+  at EBI. Use it when nodes cannot reach the internet. Every analysis then
+  runs locally, which costs CPU time but gives the same matches.
+
+Set the database up once with the profile the cluster uses, e.g. on a login
+node, before submitting jobs:
+
+```bash
+pyrgaugury setup-db -o db/ --interproscan6 --ips6-profile apptainer
+```
+
+This also caches the Nextflow version pyrgaugury uses (below) in
+`~/.nextflow`. A database made with v0.2.0 still works, but `run` warns that
+it fetches the pipeline from GitHub until `setup-db --interproscan6` is
+re-run on it; data already present are kept.
 
 **Nextflow version.** InterProScan 6.0.2.2 does not run on Nextflow 26.10:
 it stops with "Parameter `maxWorkers` is required but no value was
@@ -139,7 +187,8 @@ when it downloads data on the fly. Analyses that share one data archive
 shared archive has been downloaded, and the run fails. In testing, PROSITE
 profiles failed with `skip_flagged_profiles.txt` missing. Re-running with
 `-resume` gets past it, because finished downloads are kept, so pyrgaugury
-retries a failed InterProScan 6 run with `-resume`, up to 3 attempts in all.
+retries a run that fails on a missing data file with `-resume`, up to 3
+attempts in all. Other failures are reported straight away.
 Downloads are also strictly sequential and EBI's FTP server ran at only
 0.5–1 MB/s in testing. Populating the data directory for every member
 database (34 GB extracted) took almost 3 hours. pyrgaugury's
@@ -155,8 +204,9 @@ other_receptor RLK to a LysM RLK. NBS-encoding calls were unchanged.
 To run InterProScan 6 by hand, use:
 
 ```bash
-NXF_VER=26.04.0 nextflow run ebi-pf-team/interproscan6 -r 6.0.2.2 -profile docker,test \
-    --datadir db/interproscan --interpro latest
+NXF_VER=26.04.0 NXF_OFFLINE=true nextflow run db/interproscan6-pipeline/6.0.2.2 \
+    -profile docker,test --datadir db/interproscan \
+    --interpro 110.0 --skip-interpro-version-check
 ```
 
 ### Gene models (`--gene-models`)

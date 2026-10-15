@@ -92,6 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
     engine.add_argument("--interproscan", metavar="PATH",
                         help="use InterProScan 5: path to interproscan.sh")
     _add_ips_options(ipsg, setup=False)
+    ipsg.add_argument("--ips6-no-lookup", action="store_true",
+                      help="skip EBI's online lookup of precomputed InterProScan 6 matches "
+                           "and run every analysis locally (for compute nodes without "
+                           "internet access; same results, more CPU time)")
 
     opts = run.add_argument_group("options")
     opts.add_argument("-e", "--evalue", type=float, default=1e-5,
@@ -130,7 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ips_options(setup.add_argument_group("InterProScan 6"), setup=True)
     setup.add_argument("-t", "--threads", type=int, default=2, help="CPU threads")
     setup.add_argument("--force", action="store_true",
-                       help="re-download PRGdb and Pfam even if present and intact")
+                       help="re-download PRGdb, Pfam and the InterProScan 6 pipeline even "
+                            "if present and intact")
     return parser
 
 
@@ -145,6 +150,10 @@ def _add_ips_options(group, setup: bool) -> None:
                        help="InterProScan 6 release"
                             + ("" if setup else " (default: as recorded by setup-db, so the "
                                                 "pipeline matches its data)"))
+    group.add_argument("--ips6-interpro", metavar="RELEASE",
+                       help="InterPro data release, e.g. 110.0"
+                            + (" (default: the newest one compatible with --ips6-revision)"
+                               if setup else " (default: as recorded by setup-db)"))
     group.add_argument("--nextflow", default="nextflow", help="nextflow executable")
     group.add_argument("--ips6-nextflow-version", default=IPS6Options.nextflow_version,
                        metavar="VER",
@@ -161,14 +170,60 @@ def _add_ips_options(group, setup: bool) -> None:
                       help="explicit comma-separated InterProScan applications ('free' mode)")
 
 
-def _ips6_options(args: argparse.Namespace, datadir: Path, recorded: dict) -> IPS6Options:
+def _ips6_options(args: argparse.Namespace, datadir: Path) -> IPS6Options:
+    """InterProScan 6 options for 'setup-db', which fills in the rest itself."""
     return IPS6Options(
         datadir=datadir,
         nextflow=_require_exe(args.nextflow, "nextflow"),
-        revision=args.ips6_revision or recorded.get("revision") or IPS6Options.revision,
-        profile=args.ips6_profile or recorded.get("profile") or "docker",
-        nextflow_version=None if args.ips6_nextflow_version in ("", "installed")
-        else args.ips6_nextflow_version)
+        revision=args.ips6_revision or IPS6Options.revision,
+        profile=args.ips6_profile or "docker",
+        nextflow_version=_nextflow_version(args),
+        interpro=args.ips6_interpro)
+
+
+def _ips6_run_options(args: argparse.Namespace, dbdir: Path, datadir: Path,
+                      recorded: dict) -> tuple[IPS6Options, list[str]]:
+    """InterProScan 6 options for 'run', defaulting to what setup-db recorded.
+
+    With a local pipeline copy and a pinned InterPro release, Nextflow runs
+    offline: no GitHub API calls and no online version check. Also returns
+    warnings to log once logging is set up.
+    """
+    warnings = []
+    revision = args.ips6_revision or recorded.get("revision") or IPS6Options.revision
+    pipeline = dbdir / recorded["pipeline"] if recorded.get("pipeline") else None
+    if pipeline is not None and (revision != recorded.get("revision") or not pipeline.is_dir()):
+        pipeline = None
+    if pipeline is None:
+        warnings.append(
+            f"InterProScan 6: no local copy of pipeline {revision} in {dbdir}, so Nextflow "
+            f"fetches it from GitHub on every run (rate-limited to 60 requests per hour per IP "
+            f"address); run 'pyrgaugury setup-db -o {dbdir} --interproscan6' to add one")
+    profile = args.ips6_profile or recorded.get("profile") or "docker"
+    cache = dbdir / recorded.get("containers", "containers")
+    if any(engine in profile for engine in ("apptainer", "singularity")) and \
+            not (cache.is_dir() and any(cache.iterdir())):
+        warnings.append(
+            f"InterProScan 6: no container images cached in {cache}, so each run pulls them "
+            f"itself (concurrent runs can collide); run 'pyrgaugury setup-db -o {dbdir} "
+            f"--interproscan6 --ips6-profile {profile}' on this system to cache them")
+    opts = IPS6Options(
+        datadir=datadir,
+        nextflow=_require_exe(args.nextflow, "nextflow"),
+        revision=revision,
+        profile=profile,
+        nextflow_version=_nextflow_version(args),
+        pipeline=pipeline,
+        interpro=args.ips6_interpro or recorded.get("interpro_release"),
+        lookup=not args.ips6_no_lookup,
+        container_cache=cache if cache.is_dir() else None,
+        offline=pipeline is not None)
+    return opts, warnings
+
+
+def _nextflow_version(args: argparse.Namespace) -> str | None:
+    return None if args.ips6_nextflow_version in ("", "installed") \
+        else args.ips6_nextflow_version
 
 
 def _require_exe(name: str, what: str) -> str:
@@ -216,7 +271,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: {exc}{hint}")
     tm_exe = _require_exe(args.tm_exe or TM_DEFAULT_EXE[args.tm_tool], f"{args.tm_tool}")
     ips_exe = _require_exe(args.interproscan, "InterProScan") if args.interproscan else None
-    ips6 = None
+    ips6, ips6_warnings = None, []
     if args.interproscan6:
         if args.db is None:
             raise SystemExit("error: --interproscan6 uses the InterProScan 6 data in --db")
@@ -224,7 +279,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         if not recorded:
             raise SystemExit(f"error: {args.db} has no InterProScan 6 data; run "
                              f"'pyrgaugury setup-db -o {args.db} --interproscan6'")
-        ips6 = _ips6_options(args, found["interproscan"], recorded)
+        ips6, ips6_warnings = _ips6_run_options(args, args.db, found["interproscan"], recorded)
     blastp, makeblastdb = args.blastp, args.makeblastdb
     diamond, mmseqs = args.diamond, args.mmseqs
     if args.search_tool == "diamond":
@@ -250,6 +305,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     args.outdir.mkdir(parents=True, exist_ok=True)
     _setup_logging(args.outdir / "pyrgaugury.log")
     log.info("pyrgaugury %s: %s", __version__, " ".join(sys.argv))
+    for warning in ips6_warnings:
+        log.warning(warning)
 
     cfg = Config(
         genome=args.genome, outdir=args.outdir, prgdb=prgdb, pfam=pfam,
@@ -284,7 +341,7 @@ def cmd_setup_db(args: argparse.Namespace) -> None:
     from .dbsetup import setup_databases
     ips6 = None
     if args.interproscan6:
-        ips6 = _ips6_options(args, args.outdir / "interproscan", {})
+        ips6 = _ips6_options(args, args.outdir / "interproscan")
     args.outdir.mkdir(parents=True, exist_ok=True)
     _setup_logging(args.outdir / "setup-db.log")
     log.info("pyrgaugury %s: %s", __version__, " ".join(sys.argv))
@@ -303,7 +360,8 @@ def cmd_setup_db(args: argparse.Namespace) -> None:
     log.info("Databases ready in %s: PRGdb %s (%d sequences), Pfam %s%s%s", args.outdir,
              manifest["prgdb"]["set"], manifest["prgdb"]["sequences"],
              manifest["pfam"]["release"], " (pressed)" if manifest["pfam"]["pressed"] else "",
-             f", InterProScan 6 {manifest['interproscan6']['revision']} data"
+             f", InterProScan 6 {manifest['interproscan6']['revision']} with InterPro "
+             f"{manifest['interproscan6']['interpro_release']} data"
              if "interproscan6" in manifest else "")
     log.info("Use: pyrgaugury run --db %s ...", args.outdir)
 

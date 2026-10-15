@@ -32,6 +32,9 @@ IPS_COLUMNS = ["seq_id", "md5", "length", "analysis", "signature_acc", "signatur
 
 
 IPS6_ATTEMPTS = 3
+IPS6_REPO = "ebi-pf-team/interproscan6"
+# Environment variables naming Nextflow's image cache for these engines
+CONTAINER_CACHE_VARS = ("NXF_APPTAINER_CACHEDIR", "NXF_SINGULARITY_CACHEDIR")
 
 
 @dataclass
@@ -44,6 +47,60 @@ class IPS6Options:
     # Nextflow 26.10 rejects InterProScan 6.0.2.2's optional parameters
     # ("Parameter `maxWorkers` is required"); 26.04.0 is known to work.
     nextflow_version: str | None = "26.04.0"
+    # Local copy of the pipeline; None fetches it from GitHub, which costs an
+    # API call per run (60 per hour per IP address without a token).
+    pipeline: Path | None = None
+    # InterPro data release. None means "latest", which InterProScan resolves
+    # online (and 6.0.2.2 can mis-resolve to a directory named "latest").
+    interpro: str | None = None
+    # EBI's precomputed-match lookup (needs internet access)
+    lookup: bool = True
+    # Apptainer/Singularity image cache, unless the environment already sets one
+    container_cache: Path | None = None
+    # Stop Nextflow contacting the internet (GitHub, update checks)
+    offline: bool = False
+
+
+def ips6_command(opts: IPS6Options, input_faa: Path, workdir: Path, appl: str,
+                 threads: int) -> list[str]:
+    source = [str(Path(opts.pipeline).resolve())] if opts.pipeline is not None \
+        else [IPS6_REPO, "-r", opts.revision]
+    cmd = [opts.nextflow, "run", *source,
+           "-profile", opts.profile, "-w", str(workdir / "work"), "-ansi-log", "false",
+           "--input", str(input_faa), "--datadir", str(Path(opts.datadir).resolve()),
+           "--applications", appl, "--formats", "tsv",
+           "--outdir", str(workdir), "--outprefix", "interproscan",
+           "--max-workers", str(threads)]
+    if opts.interpro is not None:
+        cmd += ["--interpro", opts.interpro, "--skip-interpro-version-check"]
+    if not opts.lookup:
+        cmd.append("--no-matches-api")
+    return cmd
+
+
+def ips6_env(opts: IPS6Options) -> dict[str, str]:
+    env = dict(os.environ)
+    if opts.nextflow_version:
+        env["NXF_VER"] = opts.nextflow_version
+    if opts.offline:
+        env["NXF_OFFLINE"] = "true"
+    if opts.container_cache is not None:
+        for var in CONTAINER_CACHE_VARS:
+            env.setdefault(var, str(Path(opts.container_cache).resolve()))
+    return env
+
+
+def ips6_retryable(output: str, datadir: Path) -> bool:
+    """Whether a failed attempt looks like InterProScan 6.0.2.2's download race.
+
+    When two analyses share a data archive (PROSITE patterns and profiles, CATH
+    Gene3D and FunFam), one can start before the shared download finishes and
+    fails on a missing file in the data directory. Other failures (no container
+    engine, rate limits, bad options) recur on every attempt.
+    """
+    datadir = str(Path(datadir).resolve())
+    return any("No such file or directory" in line and datadir in line
+               for line in output.splitlines())
 
 
 def run_interproscan(exe: str, appl: str, proteins: list[tuple[str, str]], threads: int,
@@ -71,24 +128,16 @@ def run_interproscan6(opts: IPS6Options, appl: str, proteins: list[tuple[str, st
     """
     chunks, id_map = write_chunks(proteins, 1, workdir)
     workdir = workdir.resolve()
-    cmd = [opts.nextflow, "run", "ebi-pf-team/interproscan6", "-r", opts.revision,
-           "-profile", opts.profile, "-w", str(workdir / "work"), "-ansi-log", "false",
-           "--input", str(chunks[0].resolve()), "--datadir", str(Path(opts.datadir).resolve()),
-           "--applications", appl, "--formats", "tsv",
-           "--outdir", str(workdir), "--outprefix", "interproscan",
-           "--max-workers", str(threads)]
-    env = dict(os.environ)
-    if opts.nextflow_version:
-        env["NXF_VER"] = opts.nextflow_version
-    log.info("Running: %s%s", f"NXF_VER={opts.nextflow_version} " if opts.nextflow_version
-             else "", " ".join(cmd))
+    cmd = ips6_command(opts, chunks[0].resolve(), workdir, appl, threads)
+    env = ips6_env(opts)
+    prefix = " ".join(f"{k}={env[k]}" for k in ("NXF_VER", "NXF_OFFLINE", *CONTAINER_CACHE_VARS)
+                      if env.get(k) and env.get(k) != os.environ.get(k))
+    log.info("Running: %s", f"{prefix} {' '.join(cmd)}".strip())
     log_path = workdir / "interproscan6.log"
-    # InterProScan 6.0.2.2 can fail on a data directory that is still being
-    # populated: when two analyses share a data archive (PROSITE patterns and
-    # profiles, CATH Gene3D and FunFam), one is marked ready before the shared
-    # download has finished. Resuming keeps completed downloads and tasks, so a
-    # retry gets further each time.
+    # Resuming after the download race (see ips6_retryable) keeps completed
+    # downloads and tasks, so each retry gets further.
     for attempt in range(1, IPS6_ATTEMPTS + 1):
+        start = log_path.stat().st_size if log_path.exists() else 0
         with open(log_path, "a") as err:
             err.write(f"\n=== attempt {attempt} ===\n")
             err.flush()
@@ -96,13 +145,14 @@ def run_interproscan6(opts: IPS6Options, appl: str, proteins: list[tuple[str, st
                           stderr=subprocess.STDOUT, cwd=workdir, env=env)
         if rc == 0:
             break
-        if attempt < IPS6_ATTEMPTS:
-            log.warning("InterProScan 6 failed (exit %d, attempt %d of %d); retrying with "
-                        "-resume, which completes interrupted database downloads",
-                        rc, attempt, IPS6_ATTEMPTS)
-    if rc != 0:
-        raise RuntimeError(f"InterProScan 6 failed (exit {rc}) after {IPS6_ATTEMPTS} attempts; "
-                           f"see {log_path} and {workdir / '.nextflow.log'}")
+        with open(log_path, "rb") as fh:
+            fh.seek(start)
+            output = fh.read().decode(errors="replace")
+        if attempt == IPS6_ATTEMPTS or not ips6_retryable(output, opts.datadir):
+            raise RuntimeError(f"InterProScan 6 failed (exit {rc}, attempt {attempt}); "
+                               f"see {log_path} and {workdir / '.nextflow.log'}")
+        log.warning("InterProScan 6 hit its data download race (exit %d, attempt %d of %d); "
+                    "retrying with -resume", rc, attempt, IPS6_ATTEMPTS)
     raw = workdir / "interproscan.tsv"
     if not raw.exists():
         raise RuntimeError(f"InterProScan 6 finished but wrote no {raw.name}; see {log_path}")

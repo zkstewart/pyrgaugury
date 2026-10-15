@@ -6,7 +6,9 @@ Layout of a database directory::
     ├── pyrgaugury_db.json      manifest: what was set up, versions, dates
     ├── prgdb/                  PRGdb 4.0 reference proteins
     ├── pfam/                   Pfam-A.hmm.gz + Pfam-A.hmm.dat.gz (+ pressed files)
-    └── interproscan/           InterProScan 6 data (optional)
+    ├── interproscan/           InterProScan 6 data (optional)
+    ├── interproscan6-pipeline/ InterProScan 6 pipeline code, one folder per release
+    └── containers/             Apptainer/Singularity images for InterProScan 6
 
 Every component is verified on each run. Files that are already present and
 pass verification are kept, so re-running ``setup-db`` is cheap and also
@@ -21,12 +23,13 @@ import json
 import logging
 import os
 import shutil
+import tarfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .interproscan import IPS6Options, run_interproscan6
+from .interproscan import IPS6_REPO, IPS6Options, run_interproscan6
 from .seqio import atomic_write, read_fasta
 
 log = logging.getLogger(__name__)
@@ -42,6 +45,9 @@ PRGDB_SETS = {
 PFAM_BASE = "https://ftp.ebi.ac.uk/pub/databases/Pfam/current_release"
 PFAM_FILES = ("Pfam-A.hmm.gz", "Pfam-A.hmm.dat.gz")
 PRESSED_SUFFIXES = (".h3m", ".h3i", ".h3f", ".h3p")
+IPS6_PIPELINE_DIR = "interproscan6-pipeline"
+IPS6_CONTAINER_DIR = "containers"
+IPS6_VERSIONS_URL = "https://ftp.ebi.ac.uk/pub/software/unix/iprscan/6/{}/versions.json"
 
 # One real protein (Arabidopsis RPS5, AT1G12220.1, a CNL; Ensembl Plants TAIR10)
 # for InterProScan 6 to scan while it downloads its data
@@ -75,7 +81,7 @@ def download(url: str, dest: Path, attempts: int = 5) -> None:
         have = partial.stat().st_size if partial.exists() else 0
         if have and attempt == 1:
             log.info("  %s: continuing an earlier download from %.0f MB", dest.name, have / 1e6)
-        req =urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-"} if have else {})
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
                 if have and resp.status != 206:  # no range support: start again
@@ -212,29 +218,89 @@ def _press_pfam(hmm_gz: Path, prefix: Path) -> None:
     log.info("Pfam: pressed %d profiles", n)
 
 
-def setup_interproscan6(dbdir: Path, opts: IPS6Options, appl: str, threads: int) -> dict:
-    """Populate the InterProScan 6 data directory by scanning one small protein.
+def setup_ips6_pipeline(dbdir: Path, revision: str, force: bool) -> tuple[Path, str | None]:
+    """Keep a local copy of the InterProScan 6 pipeline code.
+
+    Running Nextflow on this copy means ``pyrgaugury run`` never asks GitHub
+    for the pipeline: unauthenticated GitHub API calls are limited to 60 per
+    hour per IP address, which a cluster's compute nodes usually share.
+    Returns the folder and the git commit it was made from (if known).
+    """
+    root = dbdir / IPS6_PIPELINE_DIR
+    dest = root / revision
+    commit_file = dest / ".pyrgaugury_commit"
+    if dest.is_dir() and not force and _pipeline_ok(dest):
+        log.info("InterProScan 6: pipeline %s already present", revision)
+        return dest, commit_file.read_text().strip() if commit_file.exists() else None
+    root.mkdir(parents=True, exist_ok=True)
+    archive = root / f"{revision}.tar.gz"
+    log.info("InterProScan 6: downloading pipeline %s from GitHub", revision)
+    download(f"https://github.com/{IPS6_REPO}/archive/{revision}.tar.gz", archive)
+    tmp = root / f".{revision}.extracting"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    with tarfile.open(archive) as tf:
+        commit = tf.pax_headers.get("comment")  # git archive records the commit here
+        tf.extractall(tmp, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+    tops = list(tmp.iterdir())
+    if len(tops) != 1 or not _pipeline_ok(tops[0]):
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"{archive} does not contain the InterProScan 6 pipeline")
+    if commit:
+        (tops[0] / ".pyrgaugury_commit").write_text(commit + "\n")
+    shutil.rmtree(dest, ignore_errors=True)
+    os.replace(tops[0], dest)
+    shutil.rmtree(tmp, ignore_errors=True)
+    archive.unlink()
+    return dest, commit
+
+
+def _pipeline_ok(path: Path) -> bool:
+    return (path / "main.nf").is_file() and (path / "nextflow.config").is_file()
+
+
+def latest_interpro(revision: str) -> str:
+    """Newest InterPro data release compatible with an InterProScan 6 release."""
+    major_minor = ".".join(revision.split(".")[:2])
+    data = json.loads(_fetch_text(IPS6_VERSIONS_URL.format(major_minor)))
+    return max((str(v) for v in data["interpro"]), key=float)
+
+
+def setup_interproscan6(dbdir: Path, opts: IPS6Options, appl: str, threads: int,
+                        force: bool = False) -> dict:
+    """Fetch the pipeline, populate its data directory and cache its containers.
 
     InterProScan 6 downloads the data for every selected analysis before it
-    scans, and skips data that are already present.
+    scans, and skips data that are already present. The check protein is
+    scanned without EBI's precomputed-match lookup, so every analysis really
+    runs and its container image is pulled (into ``containers/`` for
+    Apptainer/Singularity).
     """
+    pipeline, commit = setup_ips6_pipeline(dbdir, opts.revision, force)
+    opts.pipeline = pipeline
+    if opts.interpro is None:
+        opts.interpro = latest_interpro(opts.revision)
+    opts.lookup = False
+    opts.container_cache = dbdir / IPS6_CONTAINER_DIR
+    opts.container_cache.mkdir(exist_ok=True)
     opts.datadir.mkdir(parents=True, exist_ok=True)
     work = dbdir / ".interproscan6_setup"
     shutil.rmtree(work, ignore_errors=True)
-    log.info("InterProScan 6: checking data for %s; anything missing is downloaded "
-             "(several GB on a first setup, and EBI's FTP server can be slow)", appl)
+    log.info("InterProScan 6: checking InterPro %s data for %s; anything missing is "
+             "downloaded (several GB on a first setup, and EBI's FTP server can be slow)",
+             opts.interpro, appl)
     run_interproscan6(opts, appl, [("setup_check", _IPS6_SETUP_PROTEIN)], threads,
                       work, work / "check.tsv")
     n_hits = sum(1 for _ in open(work / "check.tsv")) - 1
     shutil.rmtree(work, ignore_errors=True)
-    interpro = sorted(p.name for p in (opts.datadir / "interpro").iterdir()) \
-        if (opts.datadir / "interpro").is_dir() else []
     members = sorted(p.name for p in opts.datadir.iterdir()
                      if p.is_dir() and p.name != "interpro")
     log.info("InterProScan 6: ready (InterPro %s; %d matches on the check protein)",
-             ", ".join(interpro) or "?", n_hits)
+             opts.interpro, n_hits)
     return {"dir": "interproscan", "revision": opts.revision, "profile": opts.profile,
-            "applications": appl, "interpro_release": interpro[-1] if interpro else None,
+            "pipeline": str(pipeline.relative_to(dbdir)), "pipeline_commit": commit,
+            "containers": IPS6_CONTAINER_DIR,
+            "applications": appl, "interpro_release": opts.interpro,
             "member_databases": members}
 
 
@@ -265,7 +331,7 @@ def setup_databases(dbdir: Path, prgdb_set: str, press_pfam: bool,
         manifest[key] = {**func(), "verified": stamp}
         write_manifest(dbdir, {**manifest, "pyrgaugury": __version__})
     if ips6 is not None:
-        manifest["interproscan6"] = {**setup_interproscan6(dbdir, ips6, ips_appl, threads),
+        manifest["interproscan6"] = {**setup_interproscan6(dbdir, ips6, ips_appl, threads, force),
                                      "verified": stamp}
     manifest["pyrgaugury"] = __version__
     write_manifest(dbdir, manifest)

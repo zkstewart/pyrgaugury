@@ -309,30 +309,109 @@ def test_interproscan_tables_v5_and_v6(tmp_path):
     assert ev["geneB"].lrr == [("IPR", 30, 300)] and ev["geneB"].rlk_lrr == [("iprscan", 30, 300)]
 
 
-def test_interproscan6_retries_with_resume(tmp_path):
-    import os
-    import stat
-    from pyrgaugury.interproscan import IPS6Options, read_ips_table, run_interproscan6
+def _fake_nextflow(tmp_path, first_failure: str):
+    """A stand-in for nextflow that logs its calls and environment.
 
+    The first attempt prints ``first_failure`` and fails; with -resume it
+    writes a one-row TSV into --outdir.
+    """
+    import stat
     calls = tmp_path / "calls.txt"
     fake = tmp_path / "nextflow"
-    # fails unless -resume is given; then writes a one-row TSV into --outdir
     fake.write_text(f"""#!/bin/sh
-echo "$NXF_VER $*" >> {calls}
-case " $* " in *" -resume "*) ;; *) exit 1 ;; esac
+echo "$NXF_VER|$NXF_OFFLINE|$NXF_APPTAINER_CACHEDIR|$*" >> {calls}
+case " $* " in *" -resume "*) ;; *) echo "{first_failure}"; exit 1 ;; esac
 while [ $# -gt 0 ]; do [ "$1" = "--outdir" ] && out=$2; shift; done
 printf 'q0\\tm\\t9\\tPfam\\tPF00931\\tNB-ARC\\t1\\t9\\t1e-9\\tT\\td\\t-\\t-\\t-\\t0\\n' \\
     > "$out/interproscan.tsv"
 """)
     fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    return fake, calls
+
+
+def test_interproscan6_retries_download_race_with_resume(tmp_path):
+    from pyrgaugury.interproscan import IPS6Options, read_ips_table, run_interproscan6
+
+    datadir = tmp_path / "data"
+    race = f"No such file or directory: {datadir.resolve()}/prosite/2026_01/skip_flagged.txt"
+    fake, calls = _fake_nextflow(tmp_path, race)
     out = tmp_path / "ips.tsv"
-    run_interproscan6(IPS6Options(datadir=tmp_path, nextflow=str(fake)), "Pfam,Gene3D",
+    run_interproscan6(IPS6Options(datadir=datadir, nextflow=str(fake)), "Pfam,Gene3D",
                       [("geneA", "MKV")], 4, tmp_path / "wd", out)
     lines = calls.read_text().splitlines()
     assert len(lines) == 2 and "-resume" not in lines[0] and "-resume" in lines[1]
-    assert lines[0].startswith("26.04.0 run ebi-pf-team/interproscan6 -r 6.0.2.2")
+    assert lines[0].startswith("26.04.0||")
+    assert "run ebi-pf-team/interproscan6 -r 6.0.2.2" in lines[0]
     assert "--applications Pfam,Gene3D" in lines[0] and "--max-workers 4" in lines[0]
+    assert "--interpro" not in lines[0] and "--no-matches-api" not in lines[0]
     assert read_ips_table(out)[0]["seq_id"] == "geneA"
+
+
+def test_interproscan6_does_not_retry_other_failures(tmp_path):
+    from pyrgaugury.interproscan import IPS6Options, run_interproscan6
+
+    fake, calls = _fake_nextflow(
+        tmp_path, "API rate limit exceeded -- Provide your GitHub user name and password")
+    with pytest.raises(RuntimeError, match="attempt 1"):
+        run_interproscan6(IPS6Options(datadir=tmp_path / "data", nextflow=str(fake)),
+                          "Pfam", [("geneA", "MKV")], 1, tmp_path / "wd", tmp_path / "o.tsv")
+    assert len(calls.read_text().splitlines()) == 1
+
+
+def test_interproscan6_offline_local_pipeline(tmp_path, monkeypatch):
+    from pyrgaugury.interproscan import IPS6Options, ips6_command, ips6_env
+
+    monkeypatch.delenv("NXF_APPTAINER_CACHEDIR", raising=False)
+    monkeypatch.setenv("NXF_SINGULARITY_CACHEDIR", "/site/cache")
+    opts = IPS6Options(datadir=tmp_path / "data", pipeline=tmp_path / "pipe" / "6.0.2.2",
+                       interpro="110.0", lookup=False, container_cache=tmp_path / "containers",
+                       offline=True)
+    cmd = " ".join(ips6_command(opts, tmp_path / "in.faa", tmp_path, "Pfam", 2))
+    assert f"run {tmp_path / 'pipe' / '6.0.2.2'} -profile docker" in cmd
+    assert "ebi-pf-team" not in cmd and " -r " not in cmd
+    assert "--interpro 110.0 --skip-interpro-version-check" in cmd
+    assert cmd.endswith("--no-matches-api")
+    env = ips6_env(opts)
+    assert env["NXF_OFFLINE"] == "true" and env["NXF_VER"] == "26.04.0"
+    assert env["NXF_APPTAINER_CACHEDIR"] == str(tmp_path / "containers")
+    assert env["NXF_SINGULARITY_CACHEDIR"] == "/site/cache"   # a site setting wins
+
+
+def test_setup_ips6_pipeline_and_latest_interpro(tmp_path, monkeypatch):
+    import io
+    import tarfile
+    from pyrgaugury import dbsetup
+
+    src = tmp_path / "src.tar.gz"
+    with tarfile.open(src, "w:gz", format=tarfile.PAX_FORMAT,
+                      pax_headers={"comment": "d431542d55"}) as tf:
+        for name in ("main.nf", "nextflow.config", "lib/x.groovy"):
+            data = b"//\n"
+            info = tarfile.TarInfo(f"interproscan6-6.0.2.2/{name}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    urls = []
+
+    def fake_download(url, dest):
+        urls.append(url)
+        dest.write_bytes(src.read_bytes())
+
+    monkeypatch.setattr(dbsetup, "download", fake_download)
+    db = tmp_path / "db"
+    db.mkdir()
+    dest, commit = dbsetup.setup_ips6_pipeline(db, "6.0.2.2", force=False)
+    assert urls == ["https://github.com/ebi-pf-team/interproscan6/archive/6.0.2.2.tar.gz"]
+    assert dest == db / "interproscan6-pipeline" / "6.0.2.2" and commit == "d431542d55"
+    assert (dest / "lib" / "x.groovy").exists()
+    assert sorted(p.name for p in dest.parent.iterdir()) == ["6.0.2.2"]
+    assert dbsetup.setup_ips6_pipeline(db, "6.0.2.2", force=False) == (dest, "d431542d55")
+    assert len(urls) == 1                                   # kept, not downloaded again
+
+    seen = []
+    monkeypatch.setattr(dbsetup, "_fetch_text", lambda url: seen.append(url) or
+                        '{"interpro": [105.0, 99.0, "109.0", "110.0"]}')
+    assert dbsetup.latest_interpro("6.0.2.2") == "110.0"
+    assert seen == ["https://ftp.ebi.ac.uk/pub/software/unix/iprscan/6/6.0/versions.json"]
 
 
 # ---- setup-db --------------------------------------------------------------
